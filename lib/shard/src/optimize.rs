@@ -557,17 +557,25 @@ fn finish_optimization(
             .try_for_each(|chunk| read_segment_holder.deduplicate_points(chunk, hw_counter))?;
     }
 
-    // Flush every segment before `drop_data` removes the source segments below.
+    // Durably flush the whole holder before `drop_data` removes the source segments below.
     //
-    // The WAL may only be acknowledged up to a version whose data is recoverable from the on-disk
-    // segments. Dropping the sources removes their data from the holder, so the rest of the holder
-    // must already be durable — otherwise a reload (which trusts the WAL acknowledgement) can come
-    // back missing points.
+    // A write that lands on a point in a frozen source segment is handled by copy-on-write: the
+    // point is relocated into an appendable segment and deleted from the source (see
+    // `apply_points_with_conditional_move`, which records a flush dependency so the new location is
+    // persisted before the source-side deletion). The merged segment does NOT carry those relocated
+    // points — their source-side deletion is replayed into it — so an appendable segment, not the
+    // merged one, holds their only live copy.
     //
-    // This has to be `flush_all`, not just the newly merged segment: optimization also writes to
-    // the temporary copy-on-write segment, and the holder can carry other un-flushed changes.
-    // Narrowing the flush to the new segment alone reproducibly loses points in the
-    // reload-divergence soak test.
+    // `drop_data` below physically deletes the source segments. Once they are gone, a relocated
+    // point is recoverable only if its appendable segment is durable, because the WAL may be
+    // acknowledged (and truncated) only up to a version whose data is on disk. Flushing just the
+    // merged segment would leave the relocation target's durability to the async flush worker,
+    // which can truncate the WAL past a relocated point before its data reaches disk — losing it on
+    // reload. This reproducibly drops points in the reload-divergence soak test.
+    //
+    // It must be `flush_all`, not a hand-picked subset: the relocation target can be any appendable
+    // segment, and only this path flushes in flush-dependency order. Already-persisted segments
+    // early-out, so the extra cost is bounded.
     read_segment_holder.flush_all(true, true)?;
 
     drop(read_segment_holder);
